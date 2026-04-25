@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12+-blue) ![React](https://img.shields.io/badge/React-18.2-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.104-green) ![Docker](https://img.shields.io/badge/Docker-Enabled-blue) ![GCP](https://img.shields.io/badge/GCP-Cloud%20Run-orange)
 
-**Team Members**: Harshitkumar Brahmbhatt, Krishna Venkatesh, Raghav Gali, Rishi Raj Kuleri, Sujitha Godishala, Swathi Baba Eswarappa
+> This repository is a personal continuation of a project originally built as team coursework at Northeastern University. It is currently undergoing a production-readiness overhaul — see **[Production Readiness Roadmap](#production-readiness-roadmap)** below for the in-progress plan.
 
 ---
 
@@ -84,8 +84,8 @@ To ensure 99.9% uptime and low latency, we employ a robust fallback strategy acr
 ### 5. Real-Time Voice Interface
 
 *   **Hands-Free Interaction**: Enables nurses and field technicians to query policy and request PTO via natural conversation while working.
-*   **Low Latency**: Optimized <500ms response time using a best-in-class pipeline (Deepgram STT/TTS + Groq/OpenAI LLM).
-*   **Secure Authentication**: Voice sessions are fully authenticated, allowing the agent to perform actions (e.g., "Book my vacation") on the user's specific behalf.
+*   **Latency**: ~3.4s end-to-end today (Deepgram STT/TTS + LLM + TTS), with a sub-1.5s p95 target in the active roadmap (streaming, connection pooling, Groq-first voice path).
+*   **Secure Authentication**: Voice sessions are fully authenticated via short-lived (1h) JWTs bridged to a 6h voice-scoped token so long conversations don't expire mid-turn.
 
 ---
 
@@ -314,7 +314,7 @@ Designed for student-budget constraints (Free Tier capable).
 
 1.  **Clone the Repo**
     ```bash
-    git clone https://github.com/MLOpsGroup9/FrontShiftAI.git
+    git clone https://github.com/Raghavgali/FrontShiftAI.git
     cd FrontShiftAI
     ```
 
@@ -337,14 +337,33 @@ Designed for student-budget constraints (Free Tier capable).
     npm run dev
     ```
 
-4.  **Visit**: `http://localhost:3000` to interact with the local Concierge.
+4.  **Visit**: `http://localhost:5173` (Vite) to interact with the local Concierge.
 
 ### Contributing
-Please fork the repository and submit Pull Requests to the `main` branch. 
-- Ensure `pytest` passes before submission.
-- Update documentation if you modify infrastructure.
+This is a personal project; external contributions aren't expected, but if you find a real bug, feel free to open an issue. Local testing conventions:
+- Run `pytest backend/tests -v` before any change that touches the API or DB layer.
+- Run `pytest stress_tests/ -v` to exercise the Phase 0 resilience, idempotency, tenancy, and JWT test suites (see `stress_tests/README.md` for env vars).
+
+---
+
+## Production Readiness Roadmap
+
+The codebase was originally a team coursework submission; it is now being hardened along a structured plan (see [`plan.md`](./plan.md) and [`system_design.md`](./system_design.md)) before further feature work. Status as of this README:
+
+| Phase | Focus | Status |
+|-------|-------|--------|
+| **0 — Critical Resilience** | Block SQLite fallback in prod, fail-fast on ChromaDB/warmup failure, thread-safe caches + LLM singleton, voice tool retries with graceful fallback, 429 `Retry-After` for Mercury/OpenAI | ✅ Complete |
+| **0.5 — Idempotency Keys** | `IdempotencyRecord` table, FastAPI dependency on mutation endpoints (`/api/pto/chat`, `/api/hr-tickets/chat`, `/api/chat/message`), voice agent auto-generates and reuses keys across retries, daily Celery cleanup | ✅ Complete |
+| **0.6 — Multi-Tenant Hardening** | Request-scoped `ContextVar` + SQLAlchemy `before_compile` listener auto-filters by `company`; `bypass_tenant_filter()` ctx manager with audit log; `TenantScopedRetriever` for ChromaDB; startup validator fails fast if any chunk lacks a `company` label; GH Actions blocks raw SQL outside allow-list | ✅ Complete |
+| **0.7 — JWT Refresh Tokens** | Access-token TTL 1y → 1h; `RefreshToken` stored as SHA-256 hash; rotation-on-use with chain-burn theft detection; `/refresh`, `/logout`, `/voice-token` endpoints; frontend Axios interceptor auto-refreshes on 401 and replays the original request | ✅ Complete |
+| **6.5 — Resilience Policy Matrix** | Single source of truth for timeout / retry / backoff / circuit-breaker per call type; `@resilient(policy=…)` decorator with per-key circuit breaker; Brave Search migrated as the reference implementation | ✅ Complete |
+| **7 — Prometheus + Grafana Observability** | Backend + voice-pipeline instrumentation (four golden signals), correlation IDs, SLO definitions, six provisioned dashboards, Locust → Prometheus export | ⏳ Up next |
+| **1–5 — Latency & Streaming** | HTTP pooling, VAD tuning, `max_tokens` + Groq voice path, SSE streaming extended to PTO/HR agents, caching, prefetch | ⏳ Deferred (after Phase 7 baseline) |
+| **5.5 — Durable LangGraph Checkpointing** | `PostgresSaver` checkpointer for multi-turn resume + admin-approval workflows | ⏳ Deferred |
+
+Tests for completed phases live in [`stress_tests/`](./stress_tests/); policy docs in [`docs/resilience_policy.md`](./docs/resilience_policy.md) and [`docs/resilience_audit.md`](./docs/resilience_audit.md).
 
 ---
 
 ## License
-Proprietary software developed by **MLOps Group 9** (Northeastern University).
+Originally developed as a coursework project at Northeastern University (MLOps Group 9); this repository is a personal continuation by Raghav Gali. License: **TBD** — treat as all-rights-reserved until a formal license file is added.

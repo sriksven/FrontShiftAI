@@ -36,9 +36,34 @@ from api.company_management import router as company_management_router
 # Import monitoring middleware
 from monitoring.middleware import MonitoringMiddleware
 
+# Tenant context (Phase 0.6)
+from db.tenant_context import set_tenant_context, clear_tenant_context
+from api.auth import decode_access_token
+
 # Import ChromaDB setup from chat_pipeline
 from chat_pipeline.rag.data_loader import ensure_chroma_store, get_collection, _embedding_function
 import time
+
+
+def _validate_chromadb_tenant_labels(collection, sample_size: int = 1000) -> None:
+    """Fail startup if any sampled ChromaDB chunk lacks a ``company`` label.
+
+    Phase 0.6E: a data-pipeline bug that ingests unlabeled chunks would
+    otherwise leak into RAG responses. Caught at boot, not at query time.
+    """
+    try:
+        sample = collection.get(include=["metadatas"], limit=sample_size)
+    except Exception as exc:
+        raise RuntimeError(f"ChromaDB tenant-label validator: unable to sample collection: {exc}") from exc
+
+    metadatas = sample.get("metadatas") or []
+    for meta in metadatas:
+        company = (meta or {}).get("company")
+        if not company or not isinstance(company, str) or not company.strip():
+            raise RuntimeError(
+                "ChromaDB tenant-label validator: found chunk with missing/empty "
+                f"'company' metadata (sample meta={meta!r}). Refusing to start."
+            )
 
 # ----------------------------
 # Lifespan Events
@@ -48,14 +73,14 @@ async def lifespan(app: FastAPI):
     print("🚀 FrontShiftAI API starting up...")
 
     # Ensure ChromaDB is available in production
-    try:
-        if os.getenv("ENVIRONMENT") == "production":
+    if os.getenv("ENVIRONMENT") == "production":
+        try:
             logger.info("Ensuring ChromaDB is available...")
             ensure_chroma_store()
             logger.info("ChromaDB ready")
-    except Exception as e:
-        logger.error(f"ChromaDB setup failed: {e}")
-        # Don't fail startup - allow service to start for debugging
+        except Exception as e:
+            logger.critical(f"Startup failed — ChromaDB unavailable: {e}")
+            raise
 
     # Initialize database
     from db import init_db
@@ -81,6 +106,11 @@ async def lifespan(app: FastAPI):
         doc_count = collection.count()
         print(f"✅ ChromaDB collection loaded ({doc_count} documents)")
 
+        # Phase 0.6E: validate every sampled chunk carries a company label.
+        print("⏳ Validating ChromaDB tenant labels...")
+        _validate_chromadb_tenant_labels(collection)
+        print("✅ ChromaDB tenant labels validated")
+
         # 3. Preload reranker model if enabled (3-10s on cold start)
         try:
             from chat_pipeline.rag.config_manager import load_rag_config
@@ -99,10 +129,10 @@ async def lifespan(app: FastAPI):
         print(f"🔥 Warmup complete in {warmup_duration:.2f}s - Ready for requests!")
 
     except Exception as e:
-        print(f"⚠️  Warmup failed: {e}")
-        import traceback
-        traceback.print_exc()
-        print("⚠️  Service will continue but first request may be slow")
+        logger.critical(f"Startup failed — RAG warmup error: {e}", exc_info=True)
+        if os.getenv("ENVIRONMENT") == "production":
+            raise
+        print("⚠️  Warmup failed (non-production) — service will continue but first request may be slow")
 
     yield
 
@@ -166,6 +196,37 @@ app.add_middleware(
 # MONITORING MIDDLEWARE
 # ----------------------------
 app.add_middleware(MonitoringMiddleware)
+
+
+# ----------------------------
+# TENANT CONTEXT MIDDLEWARE (Phase 0.6B)
+# ----------------------------
+@app.middleware("http")
+async def tenant_context_middleware(request: Request, call_next):
+    """Extract JWT and attach tenant scope to the request's ContextVar.
+
+    Unauthenticated routes (/health, /api/auth/login, docs) have no token —
+    they run with context = None, and the SQLAlchemy event listener silently
+    skips auto-filter for them (non-strict mode).
+    """
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            user = decode_access_token(token)
+            if user is not None:
+                set_tenant_context(
+                    company=user.get("company"),
+                    is_super_admin=user.get("role") == "super_admin",
+                )
+        except Exception:
+            # Invalid token — let the endpoint's auth dependency raise 401.
+            clear_tenant_context()
+    try:
+        response = await call_next(request)
+    finally:
+        clear_tenant_context()
+    return response
 
 # ----------------------------
 # Register Routers

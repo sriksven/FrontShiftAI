@@ -1,7 +1,8 @@
 """
 SQLAlchemy database models
 """
-from sqlalchemy import Column, String, DateTime, Enum, Integer, Float, Boolean, Date, UniqueConstraint
+import uuid
+from sqlalchemy import Column, String, DateTime, Enum, Integer, Float, Boolean, Date, Text, UniqueConstraint, PrimaryKeyConstraint
 from db.connection import Base
 from datetime import datetime, timezone
 import enum
@@ -226,16 +227,55 @@ class Message(Base):
 class Task(Base):
     """Background task tracking"""
     __tablename__ = "tasks"
-    
+
     id = Column(String, primary_key=True)  # UUID
     status = Column(String, default="pending")  # pending, running, completed, failed
     message = Column(String, nullable=True)
     error = Column(String, nullable=True)
-    
+
     # Task metadata
     task_type = Column(String, nullable=True)  # e.g., 'company_ingestion'
     payload = Column(String, nullable=True)  # JSON string of input args
-    
+
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class IdempotencyRecord(Base):
+    """Cached response for an Idempotency-Key scoped per tenant.
+
+    Scoped by ``(key, company)`` so the same UUID cannot collide across tenants.
+    Records older than 24h are purged by a daily cleanup cron.
+    """
+    __tablename__ = "idempotency_records"
+
+    key = Column(String, nullable=False)
+    company = Column(String, nullable=False, index=True)
+    endpoint = Column(String, nullable=False)
+    status_code = Column(Integer, nullable=False)
+    response_body = Column(Text, nullable=False)  # JSON payload
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True, nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("key", "company", name="pk_idempotency_key_company"),
+    )
+
+
+class RefreshToken(Base):
+    """Long-lived, revocable refresh token.
+
+    Rotation-on-use: every /refresh revokes this token and issues a new one
+    linked via ``rotated_from``. Re-using a revoked token revokes the entire
+    chain (theft detection).
+    """
+    __tablename__ = "refresh_tokens"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_email = Column(String, index=True, nullable=False)
+    company = Column(String, nullable=True)  # None for super_admin
+    token_hash = Column(String, unique=True, nullable=False)  # hashed secret, never raw
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    rotated_from = Column(String, nullable=True)  # previous token.id in the chain

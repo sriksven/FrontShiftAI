@@ -10,11 +10,28 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str
+    expires_in: int  # access-token TTL in seconds
     company: Optional[str] = None
     email: str
     name: Optional[str] = None
     role: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
 
 class UserInfo(BaseModel):
     email: str

@@ -1,0 +1,50 @@
+name: Tenant-Safety Raw-SQL Lint
+
+# Phase 0.6F: the SQLAlchemy ``before_compile`` listener enforces tenant
+# isolation on ORM queries, but raw ``db.execute(text(...))`` SQL bypasses
+# that entirely. We allow it only in two places: the connection bootstrap
+# and the health check. Any new raw-SQL site requires an explicit PR review
+# to justify why the ORM path doesn't fit.
+
+on:
+  pull_request:
+    paths:
+      - "backend/**/*.py"
+      - "chat_pipeline/**/*.py"
+
+jobs:
+  raw-sql-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Block db.execute(text(...)) outside allow-list
+        run: |
+          set -euo pipefail
+
+          ALLOWLIST=(
+            "backend/db/connection.py"
+            "backend/api/health.py"
+          )
+          ALLOW_RE=$(printf "%s|" "${ALLOWLIST[@]}")
+          ALLOW_RE="(${ALLOW_RE%|})"
+
+          # grep exits 1 when no match — that's the success case for us.
+          matches=$(grep -rnE \
+            --include='*.py' \
+            'db\.execute\s*\(\s*text\s*\(' \
+            backend chat_pipeline 2>/dev/null | grep -vE "^($ALLOW_RE):" || true)
+
+          if [ -n "$matches" ]; then
+            echo "::error::Raw SQL (db.execute(text(...))) detected outside the allow-list:"
+            echo "$matches"
+            echo ""
+            echo "Raw SQL bypasses the tenant event listener and can leak across tenants."
+            echo "Allowed files: ${ALLOWLIST[*]}"
+            echo "If you genuinely need raw SQL elsewhere, update the allow-list in"
+            echo ".github/workflows/pre_commit_tenant_check.yml and document why in the PR."
+            exit 1
+          fi
+
+          echo "✅ No raw SQL found outside the allow-list."

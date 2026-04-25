@@ -13,10 +13,14 @@ const api = axios.create({
   timeout: 120000, // 120 second timeout for long RAG queries
 });
 
-// Add request interceptor for debugging
+// Add request interceptor for debugging + auto-attach access token.
 api.interceptors.request.use(
   (config) => {
     console.log(`🚀 API Request: ${config.method.toUpperCase()} ${config.url}`);
+    const token = localStorage.getItem('access_token');
+    if (token && !config.headers.Authorization) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
     return config;
   },
   (error) => {
@@ -25,26 +29,80 @@ api.interceptors.request.use(
   }
 );
 
-// Add response interceptor for debugging and global error handling
+// --- Refresh-token plumbing (Phase 0.7F) ---
+//
+// Access tokens are short-lived (1h). When any call returns 401 we attempt
+// one refresh round-trip against /api/auth/refresh, store the new pair, and
+// replay the original request transparently. If refresh itself fails, the
+// user is forced to log in again.
+//
+// A single in-flight `refreshPromise` serializes concurrent 401s so we never
+// burn multiple refresh tokens for a burst of failed requests.
+
+let refreshPromise = null;
+
+async function performRefresh() {
+  const refresh_token = localStorage.getItem('refresh_token');
+  if (!refresh_token) {
+    throw new Error('No refresh token');
+  }
+  // Bare axios (not `api`) to avoid recursion through this very interceptor.
+  const { data } = await axios.post(`${API_BASE_URL}/api/auth/refresh`, { refresh_token });
+  localStorage.setItem('access_token', data.access_token);
+  localStorage.setItem('refresh_token', data.refresh_token);
+  return data.access_token;
+}
+
+function clearSession() {
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+  localStorage.removeItem('user_email');
+  localStorage.removeItem('user_company');
+}
+
+// Add response interceptor for debugging + global error handling + refresh-on-401.
 api.interceptors.response.use(
   (response) => {
     console.log(`✅ API Response: ${response.config.url}`, response.data);
     return response;
   },
-  (error) => {
+  async (error) => {
+    const originalRequest = error.config;
+
     if (error.response) {
-      // Server responded with error status
       const status = error.response.status;
       const detail = error.response.data?.detail || "An unexpected error occurred.";
-
       console.error(`❌ API Error [${status}]:`, error.response.data);
+
+      // 401 → try one refresh round-trip and replay the original request.
+      // `_retry` guards against infinite loops if the refreshed token is
+      // still rejected (e.g. user deleted server-side).
+      const isRefreshCall = typeof originalRequest?.url === 'string'
+        && originalRequest.url.includes('/api/auth/refresh');
+
+      if (status === 401 && originalRequest && !originalRequest._retry && !isRefreshCall) {
+        originalRequest._retry = true;
+        try {
+          if (!refreshPromise) {
+            refreshPromise = performRefresh().finally(() => {
+              refreshPromise = null;
+            });
+          }
+          const newAccess = await refreshPromise;
+          originalRequest.headers = originalRequest.headers || {};
+          originalRequest.headers.Authorization = `Bearer ${newAccess}`;
+          return api(originalRequest);
+        } catch (refreshErr) {
+          console.error('Refresh failed:', refreshErr);
+          clearSession();
+          toast.error("Session expired. Please log in again.");
+          return Promise.reject(error);
+        }
+      }
 
       if (status === 401) {
         toast.error("Session expired. Please log in again.");
-        // Optional: trigger logout logic if not handled by components
-        localStorage.removeItem('access_token');
-        // Let component handle redirect via state check if possible, or reload
-        // window.location.reload(); // Can be aggressive, let's just toast for now.
+        clearSession();
       } else if (status === 403) {
         toast.error("You don't have permission to perform this action.");
       } else if (status === 422) {
@@ -55,11 +113,9 @@ api.interceptors.response.use(
         toast.error(detail);
       }
     } else if (error.request) {
-      // Request made but no response
       console.error('❌ No response from server.');
       toast.error("Unable to connect to the server. Please check your connection.");
     } else {
-      // Something else happened
       console.error('❌ Request setup error:', error.message);
       toast.error("Error setting up request.");
     }
@@ -132,8 +188,19 @@ export const getUserInfo = async () => {
   }
 };
 
-export const logout = () => {
+export const logout = async () => {
+  // Best-effort: tell the server to revoke the refresh token. Ignore
+  // failures — we're clearing local state regardless.
+  const refresh_token = localStorage.getItem('refresh_token');
+  if (refresh_token) {
+    try {
+      await api.post('/api/auth/logout', { refresh_token });
+    } catch (e) {
+      console.warn('Logout revoke failed (continuing):', e?.message || e);
+    }
+  }
   localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
   localStorage.removeItem('user_email');
   localStorage.removeItem('user_company');
 };
@@ -580,29 +647,37 @@ export const getMonitoringStats = async (timeRange = '7d') => {
 
 // -------------- Voice Agent APIs --------------
 
-// Create voice session with LiveKit
+// Create voice session with LiveKit.
+//
+// Phase 0.7G: we don't pass the 1h access token to the voice worker anymore —
+// we first call /api/auth/voice-token to mint a 6h voice-scoped token, then
+// embed *that* in the LiveKit session. Voice sessions can outlive an access
+// token (2h LiveKit TTL, long conversations), and the worker has no refresh
+// flow — the scoped token bridges that gap without weakening regular auth.
 export const createVoiceSession = async (userEmail = null, company = null) => {
   try {
-    // Use VITE_VOICE_API_URL for voice agent (Modal or local)
     const voiceApiUrl = import.meta.env.VITE_VOICE_API_URL || import.meta.env.VITE_MODAL_VOICE_AGENT_URL || 'http://localhost:8001';
-    
-    // Get user's JWT token for backend authentication passthrough
-    const userToken = localStorage.getItem('access_token');
-    if (!userToken) {
-      throw new Error('Not authenticated - please login first');
+
+    // Mint a voice-scoped token via backend; uses the request interceptor's
+    // auto-attach Authorization header. If the current access token is stale
+    // the interceptor will refresh and retry once.
+    const { data: voiceTokenData } = await api.post('/api/auth/voice-token');
+    const voiceToken = voiceTokenData?.access_token;
+    if (!voiceToken) {
+      throw new Error('Backend did not return a voice token');
     }
-    
+
     console.log('🎙️ Creating voice session...');
     console.log('   Voice API URL:', voiceApiUrl);
     console.log('   User:', userEmail);
     console.log('   Company:', company);
-    
+
     const response = await axios.post(`${voiceApiUrl}/session`, {
       user_email: userEmail,
       company: company,
-      user_token: userToken  // Pass user's JWT for backend auth
+      user_token: voiceToken,  // 6h voice-scoped token, not the 1h access token
     });
-    
+
     console.log('✅ Voice session created:', response.data);
     return response.data;  // {session_id, room_name, token, livekit_url}
   } catch (error) {

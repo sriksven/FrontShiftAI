@@ -2,12 +2,12 @@ import os
 import json
 import subprocess
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from sqlalchemy.orm import Session
 from .worker import celery_app
 from db import SessionLocal
-from db.models import Task, Company
+from db.models import Task, Company, IdempotencyRecord
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,32 @@ def process_company_pipeline_task(self, task_id: str, company_name: str, domain:
         
     finally:
         db.close()
+
+@celery_app.task
+def purge_stale_idempotency_records():
+    """Delete IdempotencyRecord rows older than 24h.
+
+    Scheduled daily (see celery beat config). Records exist only to dedupe
+    retries within a short window — beyond 24h they're dead weight.
+    """
+    db: Session = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        deleted = (
+            db.query(IdempotencyRecord)
+            .filter(IdempotencyRecord.created_at < cutoff)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        logger.info("purge_stale_idempotency_records: deleted %d rows", deleted)
+        return {"deleted": deleted}
+    except Exception:
+        db.rollback()
+        logger.exception("purge_stale_idempotency_records failed")
+        raise
+    finally:
+        db.close()
+
 
 @celery_app.task(bind=True)
 def process_delete_company_task(self, task_id: str, company_name: str):

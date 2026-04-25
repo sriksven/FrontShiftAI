@@ -10,6 +10,7 @@ from services import (
 )
 from api.auth import get_current_user
 from db import get_db
+from db.tenant_context import bypass_tenant_filter
 
 router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
@@ -30,9 +31,13 @@ async def get_company_admins(
 ):
     """Get all company admins (Super Admin only)"""
     require_admin(current_user, "super_admin")
-    
+
     from db.models import User, UserRole
-    admins = db.query(User).filter(User.role == UserRole.COMPANY_ADMIN).all()
+    with bypass_tenant_filter(
+        reason="list company admins across all tenants",
+        actor=current_user["email"],
+    ):
+        admins = db.query(User).filter(User.role == UserRole.COMPANY_ADMIN).all()
     return {
         "admins": [
             {
@@ -52,10 +57,16 @@ async def get_all_companies_admin(
 ):
     """Get all companies (Super Admin only)"""
     require_admin(current_user, "super_admin")
-    
+
     from db.models import Company
-    companies = db.query(Company).all()
-    
+    # Company has no company column, so the listener wouldn't filter it anyway,
+    # but wrap for consistency and audit-log traceability.
+    with bypass_tenant_filter(
+        reason="list all companies",
+        actor=current_user["email"],
+    ):
+        companies = db.query(Company).all()
+
     return {
         "companies": [
             {
@@ -241,21 +252,23 @@ async def bulk_delete_company_users(
     if not company_exists:
         raise HTTPException(status_code=404, detail=f"Company '{company_name}' not found")
 
-    # Fetch users to be deleted for logging/confirmation
-    users_to_delete = db.query(User).filter(User.company == company_name).all()
-    count = len(users_to_delete)
-    
-    if count == 0:
-        return {"message": f"No users found for company '{company_name}'", "count": 0}
+    # Super-admin explicitly targeting another tenant — bypass the event listener.
+    with bypass_tenant_filter(
+        reason=f"bulk delete users for company={company_name}",
+        actor=current_user["email"],
+    ):
+        users_to_delete = db.query(User).filter(User.company == company_name).all()
+        count = len(users_to_delete)
 
-    # Perform deletion
-    try:
-        # We can do a bulk delete query
-        db.query(User).filter(User.company == company_name).delete(synchronize_session=False)
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete users: {str(e)}")
+        if count == 0:
+            return {"message": f"No users found for company '{company_name}'", "count": 0}
+
+        try:
+            db.query(User).filter(User.company == company_name).delete(synchronize_session=False)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to delete users: {str(e)}")
 
     return {
         "message": f"Successfully deleted {count} users from company '{company_name}'",
@@ -317,7 +330,9 @@ async def get_monitoring_stats(
     # Determine scope
     is_super_admin = current_user["role"] == "super_admin"
     company_filter = None if is_super_admin else current_user.get("company")
-    
+    # Super-admin already skips auto-tenant-filter at the event-listener layer
+    # (see db/tenant_context.py), so no explicit bypass is needed here.
+
     # Time range calculation
     now = datetime.now(timezone.utc)
     if time_range == "24h":
@@ -326,7 +341,7 @@ async def get_monitoring_stats(
         start_date = now - timedelta(days=30)
     else: # default 7d
         start_date = now - timedelta(days=7)
-        
+
     # 1. Request Count Over Time (Messages)
     query = db.query(
         func.date(Message.created_at).label('date'),

@@ -1,6 +1,7 @@
 """
 Database connection and session management
 """
+import logging
 import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -9,12 +10,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 def get_database_url():
-    """Auto-detect which database to use based on availability"""
+    """Auto-detect which database to use based on availability.
+
+    In production (ENVIRONMENT=production), PostgreSQL is required — raises
+    RuntimeError if unreachable instead of silently falling back to an
+    ephemeral SQLite file (which would lose all writes on container restart).
+    """
     postgres_url = "postgresql://postgres:MLOpsgroup%409@127.0.0.1:5432/frontshiftai"
     sqlite_url = "sqlite:///./frontshiftai.db"
-    
-    # Try PostgreSQL first
+
     try:
         test_engine = create_engine(postgres_url, poolclass=NullPool)
         with test_engine.connect() as conn:
@@ -23,7 +30,11 @@ def get_database_url():
         print("✅ Using PostgreSQL (Cloud SQL)")
         return postgres_url
     except Exception as e:
-        print(f"⚠️  PostgreSQL unavailable, falling back to SQLite")
+        if os.getenv("ENVIRONMENT") == "production":
+            raise RuntimeError(
+                f"PostgreSQL required in production but unavailable: {e}"
+            ) from e
+        logger.warning("PostgreSQL unavailable, falling back to SQLite (dev/test only)")
         return sqlite_url
 
 # Allow override via environment variable, otherwise auto-detect

@@ -29,6 +29,7 @@ from agents.hr_ticket.tools import (
     get_ticket_stats
 )
 from api.auth import get_current_user
+from api.idempotency import IdempotencyGuard, idempotency_guard
 from monitoring.production_logger import production_monitor  # ADD THIS
 
 router = APIRouter(prefix="/api/hr-tickets", tags=["HR Tickets"])
@@ -42,27 +43,34 @@ router = APIRouter(prefix="/api/hr-tickets", tags=["HR Tickets"])
 async def create_ticket_via_chat(
     request: HRTicketChatRequest,
     current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    idem: IdempotencyGuard = Depends(idempotency_guard),
 ):
     """
     Create an HR ticket via chat interface.
     User sends a natural language message, agent parses and creates ticket.
     """
+    # Idempotency: replayed voice tool calls (same key) return the cached response
+    # without creating a duplicate HRTicket.
+    cached = idem.lookup(db, current_user["company"], endpoint="/api/hr-tickets/chat")
+    if cached is not None:
+        return cached
+
     start_time = time.time()  # ADD THIS
     success = False  # ADD THIS
-    
+
     try:
         agent = get_hr_ticket_agent()
-        
+
         result = await agent.process_message(
             user_email=current_user["email"],
             company=current_user["company"],
             message=request.message,
             db=db
         )
-        
+
         success = True  # ADD THIS
-        
+
         # Log agent execution
         execution_time_ms = (time.time() - start_time) * 1000
         production_monitor.log_agent_execution(
@@ -71,7 +79,7 @@ async def create_ticket_via_chat(
             success=True,
             company_id=current_user["company"]
         )
-        
+
         # Log ticket creation metric
         if result["ticket_created"] and production_monitor.run:
             production_monitor.run.log({
@@ -79,22 +87,30 @@ async def create_ticket_via_chat(
                 "business/company": current_user["company"],
                 "timestamp": time.time()
             })
-        
+
         # Get ticket details if created
         ticket_details = None
         if result["ticket_created"] and result["ticket_id"]:
             ticket = get_ticket_by_id(db, result["ticket_id"], current_user["company"])
             if ticket:
                 ticket_details = HRTicketResponse.model_validate(ticket)
-        
-        return HRTicketChatResponse(
+
+        response = HRTicketChatResponse(
             response=result["response"],
             ticket_created=result["ticket_created"],
             ticket_id=result.get("ticket_id"),
             queue_position=result.get("queue_position"),
             ticket_details=ticket_details
         )
-    
+        idem.store(
+            db,
+            current_user["company"],
+            endpoint="/api/hr-tickets/chat",
+            status_code=200,
+            body=response.model_dump(),
+        )
+        return response
+
     except Exception as e:
         # Log failure
         execution_time_ms = (time.time() - start_time) * 1000

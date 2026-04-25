@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -200,6 +201,7 @@ class RAGPipeline:
         self.config = PipelineConfig.from_dict(self._base_config)
         self.cache_size = max(int(cache_size), 0)
         self._cache: OrderedDict[str, Tuple[str, List[Dict[str, Any]]]] = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Component registration helpers
@@ -293,15 +295,18 @@ class RAGPipeline:
         use_cache = not effective_stream and self.cache_size > 0
         if use_cache:
             cache_key = self._make_cache_key(query, company_name, settings)
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                cache_hit = True
-                self._cache.move_to_end(cache_key)
-                cached_answer, cached_metadata = cached
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    self._cache.move_to_end(cache_key)
+                    cached_answer, cached_metadata = cached
+                    cached_metadata_copy = copy.deepcopy(cached_metadata)
+                    cache_hit = True
+            if cache_hit:
                 timings["cache_hit"] = 1.0
                 return PipelineResult(
                     answer=cached_answer,
-                    metadata=copy.deepcopy(cached_metadata),
+                    metadata=cached_metadata_copy,
                     streamed=False,
                     config=settings,
                     timings=timings,
@@ -382,10 +387,12 @@ class RAGPipeline:
     ) -> None:
         if self.cache_size <= 0:
             return
-        self._cache[cache_key] = (answer, copy.deepcopy(metadata))
-        self._cache.move_to_end(cache_key)
-        while len(self._cache) > self.cache_size:
-            self._cache.popitem(last=False)
+        metadata_copy = copy.deepcopy(metadata)
+        with self._cache_lock:
+            self._cache[cache_key] = (answer, metadata_copy)
+            self._cache.move_to_end(cache_key)
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
 
     def _validate_components(self, settings: PipelineConfig) -> None:
         retriever_name = settings.retriever.name

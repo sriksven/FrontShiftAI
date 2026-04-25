@@ -11,10 +11,8 @@ router = APIRouter()
 async def health_check():
     """Health check for Cloud Run and monitoring"""
     try:
-        # Check database connection
-        db = SessionLocal()
-        db.execute(text("SELECT 1"))
-        db.close()
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
 
         return {
             "status": "healthy",
@@ -46,10 +44,8 @@ async def readiness_check():
     }
 
     try:
-        # Check database
-        db = SessionLocal()
-        db.execute(text("SELECT 1"))
-        db.close()
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
         health_status["database"] = "connected"
     except Exception as e:
         health_status["database"] = f"error: {str(e)}"

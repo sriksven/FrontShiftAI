@@ -13,6 +13,7 @@ from datetime import datetime
 from db.connection import get_db
 from db.models import Conversation, Message, User
 from api.auth import get_current_user
+from api.idempotency import IdempotencyGuard, idempotency_guard
 from api.rag import rag_query
 from agents.pto.agent import PTOAgent
 from agents.hr_ticket.agent import HRTicketAgent
@@ -165,7 +166,8 @@ JSON format:
 async def unified_chat(
     request: ChatRequest,
     current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    idem: IdempotencyGuard = Depends(idempotency_guard),
 ):
     """
     Unified chat endpoint - intelligently routes to RAG, PTO, or HR Ticket agents
@@ -174,7 +176,23 @@ async def unified_chat(
     message = request.message
     conversation_id = request.conversation_id
     company = current_user["company"]
-    
+
+    # Idempotency: if the client replays with the same key, return the cached
+    # response and skip writing duplicate Conversation/Message rows or
+    # duplicate PTO/HR tickets downstream.
+    cached = idem.lookup(db, company, endpoint="/api/chat/message")
+    if cached is not None:
+        return cached
+
+    def _respond(**kwargs) -> ChatResponse:
+        """Build ChatResponse and persist it under the idempotency key (if any)."""
+        resp = ChatResponse(**kwargs)
+        idem.store(
+            db, company, endpoint="/api/chat/message",
+            status_code=200, body=resp.model_dump(),
+        )
+        return resp
+
     # Start timing
     start_time = time.time()
     
@@ -250,7 +268,7 @@ async def unified_chat(
             db.add(assistant_message)
             db.commit()
             
-            return ChatResponse(
+            return _respond(
                 response=result["response"],
                 agent_used="pto",
                 conversation_id=conversation_id,
@@ -298,7 +316,7 @@ async def unified_chat(
             db.add(assistant_message)
             db.commit()
             
-            return ChatResponse(
+            return _respond(
                 response=result["response"],
                 agent_used="hr_ticket",
                 conversation_id=conversation_id,
@@ -345,7 +363,7 @@ async def unified_chat(
             db.add(assistant_message)
             db.commit()
             
-            return ChatResponse(
+            return _respond(
                 response=result["response"],
                 agent_used="website_extraction",
                 conversation_id=conversation_id,
@@ -412,7 +430,7 @@ async def unified_chat(
                 db.add(assistant_message)
                 db.commit()
                 
-                return ChatResponse(
+                return _respond(
                     response=website_result["response"],
                     agent_used="website_extraction",
                     conversation_id=conversation_id,
@@ -449,7 +467,7 @@ async def unified_chat(
             db.add(assistant_message)
             db.commit()
             
-            return ChatResponse(
+            return _respond(
                 response=rag_result.answer,
                 agent_used="rag",
                 conversation_id=conversation_id,
@@ -484,6 +502,8 @@ async def unified_chat(
         db.add(error_message)
         db.commit()
         
+        # Don't cache error responses — a retry with the same key should get
+        # a real attempt, not the cached apology.
         return ChatResponse(
             response="I apologize, but I encountered an internal error while processing your request. Our team has been notified.",
             agent_used="error",

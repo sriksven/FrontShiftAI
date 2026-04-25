@@ -77,6 +77,21 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 
+# Endpoints that mutate server state and therefore need idempotency keys on
+# retries. Read-only paths (e.g. /api/rag/query) are safe to replay without
+# a key. Kept here so BackendClient can auto-generate keys without each tool
+# caller having to remember.
+_MUTATION_PATH_PREFIXES = (
+    "/api/pto/chat",
+    "/api/hr-tickets/chat",
+    "/api/chat/message",
+)
+
+
+def _is_mutation_path(path: str) -> bool:
+    return any(path.startswith(prefix) for prefix in _MUTATION_PATH_PREFIXES)
+
+
 class BackendClient:
     """HTTP client for backend API calls with JWT authentication."""
     
@@ -93,13 +108,72 @@ class BackendClient:
         self.headers = {"Authorization": f"Bearer {new_token}"}
         logger.info(f"🔑 Backend client token UPDATED: {new_token[:20]}...{new_token[-10:]}" if len(new_token) > 30 else f"🔑 Token updated")
 
-    async def post(self, path: str, payload: dict, timeout: float = 120) -> dict:
+    async def post(
+        self,
+        path: str,
+        payload: dict,
+        timeout: float = 120,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> dict:
         """Make POST request with configurable timeout."""
         logger.info(f"📤 POST {self.base_url}{path}")
-        async with httpx.AsyncClient(base_url=self.base_url, headers=self.headers, timeout=timeout) as client:
+        headers = self.headers
+        if extra_headers:
+            headers = {**self.headers, **extra_headers}
+        async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=timeout) as client:
             resp = await client.post(path, json=payload)
             resp.raise_for_status()
             return resp.json()
+
+    async def post_with_retry(
+        self,
+        path: str,
+        payload: dict,
+        timeout: float = 120,
+        max_retries: int = 2,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """POST with retries + a graceful fallback payload on final failure.
+
+        If ``idempotency_key`` is provided (or one is generated when omitted for
+        a mutation-style path), it is sent as the ``Idempotency-Key`` header on
+        *every* retry of the same logical call — the backend then dedupes so a
+        transient network error doesn't create duplicate PTO/HR records.
+        """
+        # Auto-generate a key for known mutation endpoints when the caller
+        # didn't supply one. Read-only endpoints (RAG) don't need it.
+        if idempotency_key is None and _is_mutation_path(path):
+            idempotency_key = str(uuid.uuid4())
+
+        extra_headers: Optional[Dict[str, str]] = None
+        if idempotency_key:
+            extra_headers = {"Idempotency-Key": idempotency_key}
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await self.post(
+                    path, payload, timeout=timeout, extra_headers=extra_headers
+                )
+            except Exception as e:
+                last_exc = e
+                if attempt == max_retries:
+                    logger.error(
+                        f"Tool call {path} failed after {max_retries + 1} attempts: {e}"
+                    )
+                    return {
+                        "answer": "I'm having trouble looking that up right now. Please try again.",
+                        "sources": [],
+                        "error": True,
+                        "detail": str(e),
+                    }
+                backoff = 1.0 * (attempt + 1)
+                logger.warning(
+                    f"Tool call {path} attempt {attempt + 1}/{max_retries + 1} failed: {e}; retrying in {backoff}s"
+                )
+                await _asyncio.sleep(backoff)
+        # Unreachable, but keeps type-checkers quiet.
+        raise RuntimeError(f"post_with_retry exited unexpectedly: {last_exc}")
 
     async def health_check(self) -> bool:
         """Check if backend is reachable."""
@@ -372,45 +446,15 @@ class VoiceAgent(Agent):
             )
 
             payload = {"query": query, "top_k": top_k}
-            try:
-                # Use longer timeout for RAG queries (they can be slow)
-                data = await self.backend.post("/api/rag/query", payload, timeout=120)
-                duration = time.time() - start_time
+            # Use longer timeout for RAG queries (they can be slow).
+            # post_with_retry returns a graceful {"error": True, ...} dict on final failure
+            # instead of raising, so we never crash the voice turn.
+            data = await self.backend.post_with_retry(
+                "/api/rag/query", payload, timeout=120, max_retries=2
+            )
+            duration = time.time() - start_time
 
-                backend_duration = data.get("duration_seconds", 0.0)
-                retrieval_duration = data.get("retrieval_duration_seconds", 0.0)
-                generation_duration = data.get("generation_duration_seconds", 0.0)
-                cache_hit = data.get("cache_hit", False)
-                sources_count = len(data.get('sources', []))
-
-                await self.rag_metrics.on_rag_query_complete(
-                    session_id=self.session_id,
-                    query=query,
-                    total_duration=duration,
-                    backend_duration=backend_duration,
-                    retrieval_duration=retrieval_duration,
-                    generation_duration=generation_duration,
-                    sources_count=sources_count,
-                    cache_hit=cache_hit
-                )
-
-                logger.info(
-                    f"✅ RAG query successful in {duration:.2f}s",
-                    extra={
-                        "session_id": self.session_id,
-                        "query": query,
-                        "sources_count": sources_count,
-                        "metric_type": "rag_tool_call"
-                    }
-                )
-                return {
-                    "answer": data["answer"],
-                    "sources": data["sources"],
-                    "company": data["company"],
-                }
-            except Exception as e:
-                duration = time.time() - start_time
-
+            if data.get("error"):
                 await self.rag_metrics.on_rag_query_complete(
                     session_id=self.session_id,
                     query=query,
@@ -419,45 +463,82 @@ class VoiceAgent(Agent):
                     retrieval_duration=0.0,
                     generation_duration=0.0,
                     sources_count=0,
-                    error=e
+                    error=RuntimeError(data.get("detail", "tool call failed")),
                 )
-
                 logger.error(
-                    f"❌ RAG query failed after {duration:.2f}s: {e}",
+                    f"❌ RAG query failed after {duration:.2f}s (graceful fallback returned)",
                     extra={
                         "session_id": self.session_id,
                         "query": query,
-                        "error": str(e),
-                        "metric_type": "rag_tool_call_error"
+                        "error": data.get("detail"),
+                        "metric_type": "rag_tool_call_error",
                     },
-                    exc_info=True
                 )
-                raise
+                return {
+                    "answer": data["answer"],
+                    "sources": data.get("sources", []),
+                    "error": True,
+                }
+
+            backend_duration = data.get("duration_seconds", 0.0)
+            retrieval_duration = data.get("retrieval_duration_seconds", 0.0)
+            generation_duration = data.get("generation_duration_seconds", 0.0)
+            cache_hit = data.get("cache_hit", False)
+            sources_count = len(data.get('sources', []))
+
+            await self.rag_metrics.on_rag_query_complete(
+                session_id=self.session_id,
+                query=query,
+                total_duration=duration,
+                backend_duration=backend_duration,
+                retrieval_duration=retrieval_duration,
+                generation_duration=generation_duration,
+                sources_count=sources_count,
+                cache_hit=cache_hit
+            )
+
+            logger.info(
+                f"✅ RAG query successful in {duration:.2f}s",
+                extra={
+                    "session_id": self.session_id,
+                    "query": query,
+                    "sources_count": sources_count,
+                    "metric_type": "rag_tool_call"
+                }
+            )
+            return {
+                "answer": data["answer"],
+                "sources": data["sources"],
+                "company": data["company"],
+            }
 
         @function_tool
         async def website_search(query: str) -> dict:
             """Search company website for public information."""
             logger.info(f"🔧 website_search tool called with query: {query}")
             payload = {"message": f"search the company website for: {query}"}
-            try:
-                resp = await self.backend.post("/api/chat/message", payload, timeout=60)
-                logger.info(f"✅ Website search successful")
-                return resp
-            except Exception as e:
-                logger.error(f"❌ Website search failed: {e}", exc_info=True)
-                raise
+            resp = await self.backend.post_with_retry(
+                "/api/chat/message", payload, timeout=60, max_retries=2
+            )
+            if resp.get("error"):
+                logger.error(f"❌ Website search failed: {resp.get('detail')}")
+            else:
+                logger.info("✅ Website search successful")
+            return resp
 
         @function_tool
         async def request_pto(message: str) -> dict:
             """Request PTO, check balance, or modify PTO requests."""
-            resp = await self.backend.post("/api/pto/chat", {"message": message}, timeout=60)
-            return resp
+            return await self.backend.post_with_retry(
+                "/api/pto/chat", {"message": message}, timeout=60, max_retries=2
+            )
 
         @function_tool
         async def create_hr_ticket(message: str) -> dict:
             """Escalate to HR for meetings, payroll, etc."""
-            resp = await self.backend.post("/api/hr-tickets/chat", {"message": message}, timeout=60)
-            return resp
+            return await self.backend.post_with_retry(
+                "/api/hr-tickets/chat", {"message": message}, timeout=60, max_retries=2
+            )
 
         agent_tools = [
             query_info,
@@ -608,8 +689,26 @@ async def entrypoint(ctx: JobContext):
         user_email = user_metadata.get("user_email")
         company = user_metadata.get("company")
         logger.info(f"🔐 User authenticated: {user_email} @ {company}")
-    else:
-        logger.warning("⚠️ No user token found - using service account (auth may fail!)")
+
+    if not user_token:
+        # Fail closed: refuse to start the session with a service-account token.
+        # Backend calls would fail later with confusing auth errors; better to
+        # apologize clearly now and exit.
+        logger.error(
+            "❌ No valid user token after metadata wait — aborting session to avoid running with service-account credentials"
+        )
+        try:
+            tts_chain_tmp = _build_tts_chain(CONFIG.livekit.tts)
+            session_tmp = AgentSession(tts=tts_chain_tmp)
+            await session_tmp.start(agent=Agent(instructions=""), room=ctx.room)
+            await session_tmp.say(
+                "I'm sorry, I couldn't verify your account for this session. "
+                "Please refresh the page and try again.",
+                allow_interruptions=False,
+            )
+        except Exception:
+            logger.exception("Failed to deliver auth-failure apology to user")
+        return
 
     # Build provider chains
     stt_chain = _build_stt_chain(CONFIG.livekit.stt)

@@ -5,6 +5,7 @@ Handles Groq, Local Model, and Mercury with automatic fallback, circuit breaking
 
 import os
 import logging
+import threading
 import time
 from typing import Optional, Dict, Any
 import requests
@@ -276,12 +277,15 @@ class AgentLLMClient:
 
 
 # Singleton instance
-_llm_client = None
+_llm_client: Optional[AgentLLMClient] = None
+_llm_client_lock = threading.Lock()
 
 
 def get_llm_client() -> AgentLLMClient:
-    """Get or create LLM client singleton"""
+    """Get or create LLM client singleton (thread-safe double-checked locking)."""
     global _llm_client
     if _llm_client is None:
-        _llm_client = AgentLLMClient()
+        with _llm_client_lock:
+            if _llm_client is None:
+                _llm_client = AgentLLMClient()
     return _llm_client

@@ -19,6 +19,7 @@ from schemas.pto import (
     PTOApprovalRequest
 )
 from api.auth import get_current_user
+from api.idempotency import IdempotencyGuard, idempotency_guard
 from agents.pto.agent import PTOAgent
 from monitoring.production_logger import production_monitor  # ADD THIS
 
@@ -31,28 +32,35 @@ router = APIRouter(prefix="/api/pto", tags=["PTO Agent"])
 async def chat_with_agent(
     request: AgentChatRequest,
     current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    idem: IdempotencyGuard = Depends(idempotency_guard),
 ):
     """
     Chat with PTO agent
     User can request PTO, check balance, view requests, or ask questions
     """
+    # Idempotency: replayed voice tool calls (same key) return the cached response
+    # without creating a duplicate PTORequest.
+    cached = idem.lookup(db, current_user["company"], endpoint="/api/pto/chat")
+    if cached is not None:
+        return cached
+
     start_time = time.time()  # ADD THIS
     success = False  # ADD THIS
-    
+
     try:
         # Initialize agent
         agent = PTOAgent(db)
-        
+
         # Execute agent workflow
         result = await agent.execute(
             user_email=current_user["email"],
             company=current_user["company"],
             message=request.message
         )
-        
+
         success = True  # ADD THIS
-        
+
         # Log monitoring metrics
         execution_time_ms = (time.time() - start_time) * 1000
         production_monitor.log_agent_execution(
@@ -61,7 +69,7 @@ async def chat_with_agent(
             success=True,
             company_id=current_user["company"]
         )
-        
+
         # Log PTO-specific business metrics
         if result.get("request_created"):
             production_monitor.run.log({
@@ -69,14 +77,22 @@ async def chat_with_agent(
                 "business/company": current_user["company"],
                 "timestamp": time.time()
             })
-        
-        return AgentChatResponse(
+
+        response = AgentChatResponse(
             response=result["response"],
             request_created=result.get("request_created", False),
             request_id=result.get("request_id"),
             balance_info=result.get("balance_info")
         )
-        
+        idem.store(
+            db,
+            current_user["company"],
+            endpoint="/api/pto/chat",
+            status_code=200,
+            body=response.model_dump(),
+        )
+        return response
+
     except Exception as e:
         logger.error(f"Error in PTO agent chat: {e}")
         

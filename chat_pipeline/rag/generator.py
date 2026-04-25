@@ -92,6 +92,28 @@ _LLM_INSTANCE: Optional[Any] = None
 _LLM_CACHE_KEY: Optional[Tuple[str, Tuple[Tuple[str, Any], ...]]] = None
 _HF_CLIENT: Optional[InferenceClient] = None  # type: ignore[assignment]
 
+
+def _parse_retry_after(value: Any) -> Optional[float]:
+    """Parse a Retry-After header value (seconds or HTTP-date) into float seconds."""
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        from datetime import datetime, timezone
+        dt = parsedate_to_datetime(str(value))
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
 if tiktoken is not None:  # pragma: no branch - simple init
     try:
         _TOKEN_ENCODER = tiktoken.get_encoding(os.getenv("TIKTOKEN_ENCODING", "cl100k_base"))
@@ -277,7 +299,7 @@ def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
         try:
             if REMOTE_MIN_DELAY > 0 and attempt > 1:
                 time.sleep(REMOTE_MIN_DELAY)
-            
+
             # Using httpx for better stability in Cloud Run (avoids potential requests/urllib3 SIGABRT)
             with httpx.Client(timeout=REMOTE_TIMEOUT) as client:
                 response = client.post(
@@ -295,12 +317,37 @@ def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
             raise RuntimeError(f"Unexpected response format from Mercury API: {data}")
         except Exception as exc:
             last_exc = exc
+
+            # Honor 429 Retry-After before falling through to normal exp backoff.
+            retry_after: Optional[float] = None
+            status_code = None
+            resp_obj = getattr(exc, "response", None)
+            if resp_obj is not None:
+                status_code = getattr(resp_obj, "status_code", None)
+                if status_code == 429:
+                    try:
+                        retry_after = _parse_retry_after(resp_obj.headers.get("Retry-After"))
+                    except Exception:
+                        retry_after = None
+
+            if status_code == 429:
+                sleep_for = retry_after if retry_after is not None else delay
+                logger.warning(
+                    "Mercury API 429 on attempt %s/%s. Sleeping %.1fs before retry.",
+                    attempt, attempts, sleep_for,
+                )
+                if attempt == attempts:
+                    break
+                time.sleep(sleep_for)
+                delay *= REMOTE_BACKOFF
+                continue
+
             logger.warning("Mercury API attempt %s/%s failed: %s", attempt, attempts, exc)
             if attempt == attempts:
                 break
             time.sleep(delay)
             delay *= REMOTE_BACKOFF
-                
+
     raise RuntimeError("Mercury API failed after multiple attempts.") from last_exc
 
 
@@ -401,24 +448,58 @@ def _call_openai_api(prompt: str, params: Dict[str, Any]) -> str:
     else:
         messages.append({"role": "user", "content": prompt})
 
-    model = "gpt-4o-mini" # Default to 4o-mini if not specified, though typically we want this configurable
-    # You might want to respect a config variable for the model name if it exists.
-    # For now, hardcoding as per typical usage or respecting an env var would be better.
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=params.get("max_tokens"),
-            temperature=params.get("temperature"),
-            top_p=params.get("top_p"),
-            timeout=REMOTE_TIMEOUT,
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as exc:
-        logger.error("OpenAI API call failed: %s", exc)
-        raise
+    attempts = REMOTE_MAX_ATTEMPTS
+    delay = REMOTE_BACKOFF_START
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                timeout=REMOTE_TIMEOUT,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_exc = exc
+
+            status_code = getattr(exc, "status_code", None)
+            if status_code is None:
+                resp_obj = getattr(exc, "response", None)
+                if resp_obj is not None:
+                    status_code = getattr(resp_obj, "status_code", None)
+
+            if status_code == 429:
+                retry_after = None
+                resp_obj = getattr(exc, "response", None)
+                if resp_obj is not None:
+                    try:
+                        retry_after = _parse_retry_after(resp_obj.headers.get("Retry-After"))
+                    except Exception:
+                        retry_after = None
+                sleep_for = retry_after if retry_after is not None else delay
+                logger.warning(
+                    "OpenAI API 429 on attempt %s/%s. Sleeping %.1fs before retry.",
+                    attempt, attempts, sleep_for,
+                )
+                if attempt == attempts:
+                    break
+                time.sleep(sleep_for)
+                delay *= REMOTE_BACKOFF
+                continue
+
+            logger.warning("OpenAI API attempt %s/%s failed: %s", attempt, attempts, exc)
+            if attempt == attempts:
+                break
+            time.sleep(delay)
+            delay *= REMOTE_BACKOFF
+
+    logger.error("OpenAI API call failed after %s attempts: %s", attempts, last_exc)
+    raise RuntimeError("OpenAI API failed after multiple attempts.") from last_exc
 
 
 def _record_backend(name: Optional[str]) -> None:
